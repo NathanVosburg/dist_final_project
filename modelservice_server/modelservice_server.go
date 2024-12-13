@@ -29,12 +29,12 @@ var (
 	key              = flag.String("key", "secret", "key for CollectModels")
 	local_model_path = flag.String(
 		"local_model_path",
-		"my_model.pth",
+		"",
 		"path to local model file",
 	)
 	collected_models_path = flag.String(
 		"collected_models_path",
-		"./",
+		"",
 		"directory path for collected models",
 	)
 	ip_manager = IP_Manager{Peers: make(map[string]*pb.Peer)}
@@ -136,6 +136,12 @@ func (s *server) GetPeerList(ctx context.Context, in *pb.GetPeerListRequest) (*p
 }
 
 func getRandomModel(id uint32, peers []*pb.Peer) error {
+	println(len(peers))
+
+	if len(peers) < 1 {
+		return errors.New("no peers in network")
+	}
+
 	chosen_peer := peers[rand.Intn(len(peers))]
 
 	file, err := os.Create(fmt.Sprintf("%s/model%d.pth", *collected_models_path, id))
@@ -178,7 +184,7 @@ func getRandomModel(id uint32, peers []*pb.Peer) error {
 
 func (s *server) CollectModels(_ context.Context, in *pb.CollectModelsRequest) (*pb.CollectModelsResponse, error) {
 
-	defer os.Create(".DONE")
+	defer os.Create(fmt.Sprintf("/%s/.DONE", *collected_models_path))
 	if in.Key != *key {
 		return &pb.CollectModelsResponse{
 			Success: false,
@@ -271,6 +277,15 @@ func boot() error {
 
 func main() {
 	flag.Parse()
+	if *collected_models_path == "" {
+		str := fmt.Sprintf("./aggs/agg%d", *port)
+		collected_models_path = &str
+	}
+	if *local_model_path == "" {
+		str := fmt.Sprintf("%s/my_model%d.pth", *collected_models_path, *port)
+		local_model_path = &str
+	}
+	log.Println(*local_model_path)
 
 	if err := boot(); err != nil {
 		log.Printf("Error bootsraping: %s", err.Error())

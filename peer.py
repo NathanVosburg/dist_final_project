@@ -4,6 +4,7 @@ import torch.optim as optim
 import json
 import sys
 import grpc
+import signal
 import proto.modelservice_pb2 as pb2
 import proto.modelservice_pb2_grpc as pb2_grpc
 from time import time, sleep
@@ -15,7 +16,19 @@ import fcntl
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu")
 print(f"USING: {DEVICE}")
 
+MIN_PEERS_REQUIRED = 1  # Minimum number of peers needed for aggregation
+MAX_RETRY_ATTEMPTS = 3  # Maximum number of retry attempts for collecting models
 
+running = True
+channel = None
+port = 0
+
+def signal_handler(signum, frame):
+    global running
+    print("\nShutting down gracefully...")
+    running = False
+    if channel:
+        channel.close()
 
 class JSONDataset(Dataset):
     """
@@ -182,47 +195,68 @@ def aggregate_models(agg_dir, base_model_class, timeout=10):
     # Load the state dictionaries from all models
 
     while time() - stime < timeout:
-        if os.path.exists(".DONE"):
-            
-            agg_paths = [os.path.join(agg_dir, x) for x in os.listdir(agg_dir)]
-
-            state_dicts = [torch.load(path, map_location=DEVICE, weights_only=False) for path in agg_paths]
-            
-            # state_dicts = []
-            
-            # # TODO maybe?
-            # for path in model_paths:
+        if os.path.exists(f"./aggs/agg{port}.DONE"):
+            try:
+                agg_paths = [os.path.join(agg_dir, x) for x in os.listdir(agg_dir) if x.endswith('.pth')]
+                for path in agg_paths:
+                    print(path)
+                if len(agg_paths) < MIN_PEERS_REQUIRED:
+                    print(f"Not enough models to aggregate. Found {len(agg_paths)}, need {MIN_PEERS_REQUIRED}")
+                    os.remove("./aggs/agg{port}.DONE")
+                    return None
                 
-            #     fp = open(path, 'r')
-            #     fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)  # Attempt to acquire an exclusive lock
-            #     fcntl.flock(fp, fcntl.LOCK_UN)  # Release the lock if successful
-            #     state_dicts.append(torch.load(path, map_location=DEVICE, weights_only=False))
+                print(f"Found {len(agg_paths)} models for aggregation")
+
+
+                # valid_state_dicts = []
+                # for path in agg_paths:
+                #     try:
+                #         state_dict = torch.load(path, map_location=DEVICE)
+                #         valid_state_dicts.append(state_dict)
+                #     except Exception as e:
+                #         print(f"Error loading model from {path}: {e}")
+                #         continue
+                
+                # if len(valid_state_dicts) < MIN_PEERS_REQUIRED:
+                #     print(f"Not enough valid models after validation")
+                #     os.remove(".DONE")
+                #     return None
+                state_dict = [torch.load(path, map_location=DEVICE, weights_only=False) for path in agg_paths]
+
+                
+                base_model = base_model_class().to(DEVICE)
+                aggregated_state_dict = base_model.state_dict()
             
-            
-            # Initialize the base model and its state_dict
-            base_model = base_model_class().to(DEVICE)
-            aggregated_state_dict = base_model.state_dict()
-            
-            # Initialize the aggregated weights as zero
-            for key in aggregated_state_dict.keys():
-                aggregated_state_dict[key] = torch.zeros_like(aggregated_state_dict[key], dtype=torch.float32)
-            
-            # Aggregate weights from all models
-            num_models = len(state_dicts)
-            for state_dict in state_dicts:
+                num_models = len(state_dict)
+                for state_dict in state_dict:
+                    for key in aggregated_state_dict.keys():
+                        aggregated_state_dict[key] += state_dict[key]
+                
+                # Average the weights
                 for key in aggregated_state_dict.keys():
-                    aggregated_state_dict[key] += state_dict[key]
+                    aggregated_state_dict[key] /= num_models
+                
+                # Load the aggregated weights into the base model
+                base_model.load_state_dict(aggregated_state_dict)
+                os.remove("./aggs/agg{port}.DONE")
+                for path in agg_paths:
+                    print(path)
+                    if path != f"aggs/agg{port}/my_model{port}":
+                        try:
+                            os.remove(path)
+                        except OSError as e:
+                            print(f"Error removing {path}: {e}")
+                return base_model
             
-            # Average the weights
-            for key in aggregated_state_dict.keys():
-                aggregated_state_dict[key] /= num_models
-            
-            # Load the aggregated weights into the base model
-            base_model.load_state_dict(aggregated_state_dict)
-            os.remove(".DONE")
-            return base_model
+            except Exception as e:
+                print(f"Error during aggregation: {e}")
+                if os.path.exists("./aggs/agg{port}.DONE"):
+                    os.remove("./aggs/agg{port}.DONE")
+                return None
         
         print("TIMEOUT")
+        print(f"TIME: {time() - stime}")
+        print(f"TIME: {time() - stime < timeout}")
         return None
 
 def collect_models(client, secret_key, num_models, timeout=10):
@@ -238,28 +272,35 @@ def collect_models(client, secret_key, num_models, timeout=10):
     Returns:
         int: The number of models actually collected.
     """
-    request = pb2.CollectModelsRequest(key=secret_key, num=num_models)
+    for attempt in range(MAX_RETRY_ATTEMPTS):
+        try:
+            print(f"num_models: {num_models}")
+            request = pb2.CollectModelsRequest(key=secret_key, num=num_models)
+            response = client.CollectModels(request, timeout=timeout)
+            if response.success:
+                print(f"Successfully collected models: {response.success}.")
+                return response.success
+            else:
+                print(f"Failed to collect models on attempt {attempt + 1}")
+        except grpc.RpcError as e:
+            print(f"gRPC error on attempt {attempt + 1}: {e.code()} - {e.details()}")
 
-    try:
-        response = client.CollectModels(request, timeout=timeout)
-        if response.success:
-            print(f"Successfully collected?: {response.success}.")
-            return response.success
-        else:
-            print("Failed to collect models. Unauthorized or other issue.")
-            return 0
-    except grpc.RpcError as e:
-        print(f"gRPC error: {e.code()} - {e.details()}")
-        return 0
+        if attempt < MAX_RETRY_ATTEMPTS - 1:
+            sleep(2 ** attempt)
+    return 0
+
 
 def main():
     # lowkey could boot the go client at the start 
     # TODO this makes more sense with NLP tasks maybe
-    
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     
     if len(sys.argv) > 2:
         dataset = JSONDataset(sys.argv[1])
         dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        global port
         port = int(sys.argv[2])
         
     else:
@@ -274,63 +315,71 @@ def main():
     
     test_dataset = JSONDataset("test_data.json")
     test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=True)
-    
-    while True:
-        
-        end = time()
-        
-        if end - start > 15:
-            # this would be an RPC
-            # print("BLOCK and requesting other models to be pushed into the to_aggregate folder")
-            # sleep(3)
+
+    agg_dir = f"aggs/agg{port}"
+    if not os.path.exists(agg_dir):
+        os.makedirs(agg_dir)
+
+
+    server_address = f"localhost:{port}"
+
+    global channel 
+    channel =  grpc.insecure_channel(server_address)
+    client = pb2_grpc.ModelServiceStub(channel)
+
+    global running
+    try:
+        while running:
             
-            server_address = f"localhost:{port}"
-
-            # Connect to the server
-            with grpc.insecure_channel(server_address) as channel:
-                client = pb2_grpc.ModelServiceStub(channel)
-
-                # Secret key and number of models to collect
-                secret_key = "secret"
-                num_models = 1
-
-                # Call the function
-                collect_models(client, secret_key, num_models, timeout=10)
-                # print(f"Models collected?: {models_collected}")
-
-            """
-            so what should go here is a call to the CollectModels funciton of the go client
-            this passes:
-            - secret key (set at boot of go client via flag)  
-            - number of models to collect
-            the go client then response with the actual number of models that have been collected
-                NOTE: could be lower than requested due to lack of peers or connection failures
-            ideally should be some timeout where if there are no models recieved by then it just
-            goes back to training maybe. idk though
-            """
-
+            end = time()
             
+            if end - start > 15:
+                # this would be an RPC
+                # print("BLOCK and requesting other models to be pushed into the to_aggregate folder")
+                # sleep(3)
+                
 
-            # print("models received")
-            
-            # agg_paths = random.sample(agg_paths, 3) # this is only bc we are not actaully sending models yet -- TODO remove eventually
-            agg_dir = "agg"
-            model = aggregate_models(agg_dir, SimpleCNN)
-            
-            start = time()
-            
-        else:
-            model = train_model(dataloader, model, criterion, epochs=1)
-        
-        print(evaluate(model, test_dataloader, criterion))
+                # Connect to the server
+                try:
 
-        temp_path = f"my_model{port}.tmp"
-        try: 
-            torch.save(model.state_dict(), temp_path)
-            os.replace(temp_path, "my_model{port}.pth")
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)        
+                        # Secret key and number of models to collect
+                        secret_key = "secret"
+                        num_models = 1
+
+                        # Call the function
+                        num_models_collected = collect_models(client, secret_key, num_models, timeout=10)
+
+                        if num_models_collected > 0:
+                            new_model = aggregate_models(agg_dir, SimpleCNN)
+                            if new_model is not None:
+                                model = new_model
+                                print("Successfully aggregated models")
+                            else:
+                                print("Continuing with current model due to aggregation failure")
+                        else:
+                            print("Continuing with current model due to collection failure")
+                        # print(f"Models collected?: {models_collected}")
+                except Exception as e:
+                    print(f"Error during collection: {e}")
+                
+                start = time()
+                
+            else:
+                model = train_model(dataloader, model, criterion, epochs=1)
+            
+            print(evaluate(model, test_dataloader, criterion))
+
+            model_path = f"./aggs/agg{port}/my_model{port}.pth"
+            temp_path = f"./aggs/agg{port}/my_model{port}.tmp"
+            try: 
+                torch.save(model.state_dict(), temp_path)
+                os.replace(temp_path, model_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)      
+    finally:
+        if channel:
+            channel.close()  
 
 if __name__ == "__main__":
     main()
